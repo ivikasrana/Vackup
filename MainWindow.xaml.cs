@@ -7,7 +7,6 @@ using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
-using System.Windows.Forms;
 
 namespace Vackup
 {
@@ -45,7 +44,11 @@ namespace Vackup
             };
             DestinationBox.LostFocus += (s, e) => { _ = DetectSpeedAsync(); };
             Loaded += (s, e) => { _ = DetectSpeedAsync(); };
-            Closing += (s, e) => SaveSettings();
+            Closing += (s, e) =>
+            {
+                cts?.Cancel();
+                SaveSettings();
+            };
         }
 
         private void ThemeButton_Click(object sender, RoutedEventArgs e)
@@ -98,10 +101,6 @@ namespace Vackup
             SpeedLimitSlider.SmallChange = step;
             SpeedLimitSlider.LargeChange = step * 5;
             SpeedLimitSlider.Maximum = max;
-            if (SpeedLimitSlider.Value > max)
-            {
-                SpeedLimitSlider.Value = 0;
-            }
             SpeedDetectText.Text = "Destination writes about " + speed.ToString("0") + " MB/s";
         }
 
@@ -150,14 +149,6 @@ namespace Vackup
             return value.ToString(i == 0 ? "0" : "0.#") + " " + units[i];
         }
 
-        private string PickFolder(string description)
-        {
-            using (var dialog = new FolderBrowserDialog { Description = description, ShowNewFolderButton = true })
-            {
-                return dialog.ShowDialog() == System.Windows.Forms.DialogResult.OK ? dialog.SelectedPath : null;
-            }
-        }
-
         private void AddButton_Click(object sender, RoutedEventArgs e)
         {
             var dialog = new AddFolderDialog(DestinationBox.Text.Trim()) { Owner = this };
@@ -190,7 +181,7 @@ namespace Vackup
 
         private void BrowseButton_Click(object sender, RoutedEventArgs e)
         {
-            var path = PickFolder("Select the backup destination");
+            var path = FolderPicker.Pick("Select the backup destination");
             if (path != null)
             {
                 DestinationBox.Text = path;
@@ -218,15 +209,23 @@ namespace Vackup
                 Alert("Choose a destination.");
                 return;
             }
-            var fullDestination = Path.GetFullPath(destination).TrimEnd('\\') + "\\";
-            foreach (var s in sources)
+            try
             {
-                var fullSource = Path.GetFullPath(s).TrimEnd('\\') + "\\";
-                if (fullDestination.StartsWith(fullSource, StringComparison.OrdinalIgnoreCase))
+                var fullDestination = Path.GetFullPath(destination).TrimEnd('\\') + "\\";
+                foreach (var s in sources)
                 {
-                    Alert("The destination cannot be inside a source folder:\n" + s);
-                    return;
+                    var fullSource = Path.GetFullPath(s).TrimEnd('\\') + "\\";
+                    if (fullDestination.StartsWith(fullSource, StringComparison.OrdinalIgnoreCase))
+                    {
+                        Alert("The destination cannot be inside a source folder:\n" + s);
+                        return;
+                    }
                 }
+            }
+            catch (Exception ex)
+            {
+                Alert("Invalid folder path: " + ex.Message);
+                return;
             }
 
             var options = new BackupOptions

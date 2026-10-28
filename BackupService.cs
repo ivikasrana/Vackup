@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Threading;
 
@@ -35,6 +36,16 @@ namespace Vackup
 
     public class BackupService
     {
+        private const int BufferSize = 256 * 1024;
+        private const int ProgressIntervalMs = 100;
+
+        private class FileJob
+        {
+            public string Source;
+            public string Target;
+            public long Size;
+        }
+
         public BackupResult Run(BackupOptions options, IProgress<BackupProgress> progress, CancellationToken token)
         {
             var result = new BackupResult();
@@ -44,38 +55,27 @@ namespace Vackup
                 root = Path.Combine(root, "Backup_" + DateTime.Now.ToString("yyyy-MM-dd_HH-mm-ss"));
             }
 
-            var jobs = new List<KeyValuePair<string, string>>();
+            var jobs = new List<FileJob>();
+            var usedNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             long totalBytes = 0;
             progress.Report(new BackupProgress { Message = "Scanning folders..." });
             foreach (var source in options.Sources)
             {
-                var name = new DirectoryInfo(source).Name;
-                if (string.IsNullOrEmpty(name) || name.EndsWith(":\\"))
+                var sourceRoot = source.TrimEnd('\\');
+                var target = Path.Combine(root, UniqueName(source, usedNames));
+                var dirs = new List<string>();
+                if (!Scan(source, sourceRoot, target, jobs, dirs, ref totalBytes, progress, token))
                 {
-                    name = source.Replace(":", "").Replace("\\", "");
-                }
-                var target = Path.Combine(root, name);
-                foreach (var file in Enumerate(source, progress))
-                {
-                    if (token.IsCancellationRequested)
-                    {
-                        result.Cancelled = true;
-                        return result;
-                    }
-                    var relative = file.Substring(source.TrimEnd('\\').Length).TrimStart('\\');
-                    jobs.Add(new KeyValuePair<string, string>(file, Path.Combine(target, relative)));
-                    try
-                    {
-                        totalBytes += new FileInfo(file).Length;
-                    }
-                    catch (Exception)
-                    {
-                    }
+                    result.Cancelled = true;
+                    return result;
                 }
                 try
                 {
                     Directory.CreateDirectory(target);
-                    CreateEmptyDirectories(source, target);
+                    foreach (var dir in dirs)
+                    {
+                        Directory.CreateDirectory(dir);
+                    }
                 }
                 catch (Exception ex)
                 {
@@ -87,6 +87,7 @@ namespace Vackup
             var done = 0;
             long bytesDone = 0;
             var throttle = options.Throttle ?? new Throttle(0);
+            var reportClock = Stopwatch.StartNew();
             foreach (var job in jobs)
             {
                 if (token.IsCancellationRequested)
@@ -95,23 +96,23 @@ namespace Vackup
                     break;
                 }
                 done++;
-                long size = 0;
+                var current = done;
+                var baseBytes = bytesDone;
                 try
                 {
-                    size = new FileInfo(job.Key).Length;
-                    if (options.SkipUnchanged && IsUnchanged(job.Key, job.Value))
+                    if (options.SkipUnchanged && IsUnchanged(job))
                     {
                         result.Skipped++;
-                        bytesDone += size;
-                        progress.Report(new BackupProgress { Done = done, Total = total, BytesDone = bytesDone, BytesTotal = totalBytes, CurrentFile = job.Key, Message = "Skipped " + job.Key });
+                        bytesDone += job.Size;
+                        ReportFile(progress, reportClock, current, total, bytesDone, totalBytes, job.Source, "Skipped ", current == total);
                         continue;
                     }
-                    Directory.CreateDirectory(Path.GetDirectoryName(job.Value));
-                    var baseBytes = bytesDone;
-                    CopyFile(job.Key, job.Value, token, throttle, copied => progress.Report(new BackupProgress { Done = done - 1, Total = total, BytesDone = baseBytes + copied, BytesTotal = totalBytes, CurrentFile = job.Key, Message = "Copying " + job.Key }));
-                    bytesDone += size;
+                    Directory.CreateDirectory(Path.GetDirectoryName(job.Target));
+                    CopyFile(job, token, throttle, copied =>
+                        progress.Report(new BackupProgress { Done = current - 1, Total = total, BytesDone = baseBytes + copied, BytesTotal = totalBytes, CurrentFile = job.Source, Message = "Copying " + job.Source }));
+                    bytesDone += job.Size;
                     result.Copied++;
-                    progress.Report(new BackupProgress { Done = done, Total = total, BytesDone = bytesDone, BytesTotal = totalBytes, CurrentFile = job.Key, Message = "Copied " + job.Key });
+                    ReportFile(progress, reportClock, current, total, bytesDone, totalBytes, job.Source, "Copied ", current == total);
                 }
                 catch (OperationCanceledException)
                 {
@@ -121,85 +122,124 @@ namespace Vackup
                 catch (Exception ex)
                 {
                     result.Failed++;
-                    bytesDone += size;
-                    progress.Report(new BackupProgress { Done = done, Total = total, BytesDone = bytesDone, BytesTotal = totalBytes, CurrentFile = job.Key, Message = "Failed " + job.Key + ": " + ex.Message, IsError = true });
+                    bytesDone += job.Size;
+                    progress.Report(new BackupProgress { Done = current, Total = total, BytesDone = bytesDone, BytesTotal = totalBytes, CurrentFile = job.Source, Message = "Failed " + job.Source + ": " + ex.Message, IsError = true });
                 }
             }
             return result;
         }
 
-        private static void CopyFile(string source, string target, CancellationToken token, Throttle throttle, Action<long> onBytes)
+        // Per-file progress is rate limited so thousands of small files do not flood the UI queue.
+        private static void ReportFile(IProgress<BackupProgress> progress, Stopwatch clock, int done, int total, long bytesDone, long bytesTotal, string file, string verb, bool force)
         {
-            var buffer = new byte[128 * 1024];
-            long copied = 0;
-            var last = DateTime.UtcNow;
-            using (var input = new FileStream(source, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
-            using (var output = new FileStream(target, FileMode.Create, FileAccess.Write, FileShare.None))
+            if (!force && clock.ElapsedMilliseconds < ProgressIntervalMs)
             {
-                int read;
-                while ((read = input.Read(buffer, 0, buffer.Length)) > 0)
-                {
-                    token.ThrowIfCancellationRequested();
-                    output.Write(buffer, 0, read);
-                    throttle.Wait(read, token);
-                    copied += read;
-                    if ((DateTime.UtcNow - last).TotalMilliseconds >= 100)
-                    {
-                        last = DateTime.UtcNow;
-                        onBytes(copied);
-                    }
-                }
+                return;
             }
-            File.SetLastWriteTimeUtc(target, File.GetLastWriteTimeUtc(source));
+            clock.Restart();
+            progress.Report(new BackupProgress { Done = done, Total = total, BytesDone = bytesDone, BytesTotal = bytesTotal, CurrentFile = file, Message = verb + file });
         }
 
-        private static bool IsUnchanged(string source, string target)
+        // Two sources with the same folder name (C:\a\Docs, D:\Docs) must not merge into one target folder.
+        private static string UniqueName(string source, HashSet<string> used)
         {
-            if (!File.Exists(target))
+            var name = new DirectoryInfo(source).Name;
+            if (string.IsNullOrEmpty(name) || name.EndsWith(":\\"))
             {
-                return false;
+                name = source.Replace(":", "").Replace("\\", "");
             }
-            var s = new FileInfo(source);
-            var t = new FileInfo(target);
-            return s.Length == t.Length && Math.Abs((s.LastWriteTimeUtc - t.LastWriteTimeUtc).TotalSeconds) < 2;
+            var candidate = name;
+            for (var n = 2; !used.Add(candidate); n++)
+            {
+                candidate = name + " (" + n + ")";
+            }
+            return candidate;
         }
 
-        private static IEnumerable<string> Enumerate(string folder, IProgress<BackupProgress> progress)
+        private static bool Scan(string folder, string sourceRoot, string targetRoot, List<FileJob> jobs, List<string> dirs, ref long totalBytes, IProgress<BackupProgress> progress, CancellationToken token)
         {
             var pending = new Stack<string>();
             pending.Push(folder);
             while (pending.Count > 0)
             {
+                if (token.IsCancellationRequested)
+                {
+                    return false;
+                }
                 var current = pending.Pop();
-                string[] files = new string[0];
-                string[] dirs = new string[0];
                 try
                 {
-                    files = Directory.GetFiles(current);
-                    dirs = Directory.GetDirectories(current);
+                    var info = new DirectoryInfo(current);
+                    foreach (var f in info.GetFiles())
+                    {
+                        var relative = f.FullName.Substring(sourceRoot.Length).TrimStart('\\');
+                        jobs.Add(new FileJob { Source = f.FullName, Target = Path.Combine(targetRoot, relative), Size = f.Length });
+                        totalBytes += f.Length;
+                    }
+                    foreach (var d in info.GetDirectories())
+                    {
+                        // Junctions and symlinks can loop back into the tree (e.g. "Application Data"), so skip them.
+                        if ((d.Attributes & FileAttributes.ReparsePoint) != 0)
+                        {
+                            continue;
+                        }
+                        dirs.Add(Path.Combine(targetRoot, d.FullName.Substring(sourceRoot.Length).TrimStart('\\')));
+                        pending.Push(d.FullName);
+                    }
                 }
                 catch (Exception ex)
                 {
                     progress.Report(new BackupProgress { Message = "Cannot read " + current + ": " + ex.Message, IsError = true });
                 }
-                foreach (var f in files)
+            }
+            return true;
+        }
+
+        private static void CopyFile(FileJob job, CancellationToken token, Throttle throttle, Action<long> onBytes)
+        {
+            var buffer = new byte[BufferSize];
+            long copied = 0;
+            var clock = Stopwatch.StartNew();
+            try
+            {
+                using (var input = new FileStream(job.Source, FileMode.Open, FileAccess.Read, FileShare.ReadWrite, BufferSize, FileOptions.SequentialScan))
+                using (var output = new FileStream(job.Target, FileMode.Create, FileAccess.Write, FileShare.None, BufferSize))
                 {
-                    yield return f;
+                    int read;
+                    while ((read = input.Read(buffer, 0, buffer.Length)) > 0)
+                    {
+                        token.ThrowIfCancellationRequested();
+                        output.Write(buffer, 0, read);
+                        throttle.Wait(read, token);
+                        copied += read;
+                        if (clock.ElapsedMilliseconds >= ProgressIntervalMs)
+                        {
+                            clock.Restart();
+                            onBytes(copied);
+                        }
+                    }
                 }
-                foreach (var d in dirs)
+                File.SetLastWriteTimeUtc(job.Target, File.GetLastWriteTimeUtc(job.Source));
+            }
+            catch (Exception)
+            {
+                // Never leave a truncated file behind that a later "skip unchanged" run could trust.
+                try
                 {
-                    pending.Push(d);
+                    File.Delete(job.Target);
                 }
+                catch (Exception)
+                {
+                }
+                throw;
             }
         }
 
-        private static void CreateEmptyDirectories(string source, string target)
+        private static bool IsUnchanged(FileJob job)
         {
-            foreach (var dir in Directory.GetDirectories(source, "*", SearchOption.AllDirectories))
-            {
-                var relative = dir.Substring(source.TrimEnd('\\').Length).TrimStart('\\');
-                Directory.CreateDirectory(Path.Combine(target, relative));
-            }
+            var t = new FileInfo(job.Target);
+            return t.Exists && t.Length == job.Size
+                && Math.Abs((File.GetLastWriteTimeUtc(job.Source) - t.LastWriteTimeUtc).TotalSeconds) < 2;
         }
     }
 }
@@ -238,10 +278,16 @@ namespace Vackup
             }
             total += bytes;
             var due = total * 1000.0 / current;
-            var ahead = (int)(due - clock.ElapsedMilliseconds);
+            var ahead = due - clock.ElapsedMilliseconds;
+            if (ahead < -1000)
+            {
+                total = bytes;
+                clock.Restart();
+                ahead = bytes * 1000.0 / current;
+            }
             if (ahead > 0)
             {
-                token.WaitHandle.WaitOne(ahead);
+                token.WaitHandle.WaitOne((int)Math.Min(ahead, int.MaxValue));
                 token.ThrowIfCancellationRequested();
             }
         }

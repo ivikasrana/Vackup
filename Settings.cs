@@ -66,10 +66,19 @@ namespace Vackup
             try
             {
                 Directory.CreateDirectory(Path.GetDirectoryName(FilePath));
-                using (var stream = File.Create(FilePath))
+                var temp = FilePath + ".tmp";
+                using (var stream = File.Create(temp))
                 using (var writer = JsonReaderWriterFactory.CreateJsonWriter(stream, Encoding.UTF8, true, true, "  "))
                 {
                     new DataContractJsonSerializer(typeof(AppSettings)).WriteObject(writer, this);
+                }
+                if (File.Exists(FilePath))
+                {
+                    File.Replace(temp, FilePath, null);
+                }
+                else
+                {
+                    File.Move(temp, FilePath);
                 }
             }
             catch (Exception)

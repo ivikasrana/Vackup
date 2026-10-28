@@ -3,7 +3,6 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Windows;
-using System.Windows.Forms;
 
 namespace Vackup
 {
@@ -19,17 +18,9 @@ namespace Vackup
             Loaded += (s, e) => SourceBox.Focus();
         }
 
-        private static string Pick(string description)
-        {
-            using (var dialog = new FolderBrowserDialog { Description = description, ShowNewFolderButton = true })
-            {
-                return dialog.ShowDialog() == System.Windows.Forms.DialogResult.OK ? dialog.SelectedPath : null;
-            }
-        }
-
         private void BrowseSource_Click(object sender, RoutedEventArgs e)
         {
-            var path = Pick("Select a folder to back up");
+            var path = FolderPicker.Pick("Select a folder to back up");
             if (path != null)
             {
                 SourceBox.Text = (SourceBox.Text.TrimEnd() + Environment.NewLine + path).Trim();
@@ -38,10 +29,24 @@ namespace Vackup
 
         private void BrowseDestination_Click(object sender, RoutedEventArgs e)
         {
-            var path = Pick("Select the backup destination");
+            var path = FolderPicker.Pick("Select the backup destination");
             if (path != null)
             {
                 DestinationBox.Text = path;
+            }
+        }
+
+        // Full path without a trailing separator (except for a drive root), so duplicates compare equal.
+        private static string NormalizePath(string path)
+        {
+            try
+            {
+                var full = Path.GetFullPath(path);
+                return Path.GetPathRoot(full) == full ? full : full.TrimEnd('\\');
+            }
+            catch (Exception)
+            {
+                return path;
             }
         }
 
@@ -52,6 +57,7 @@ namespace Vackup
                 .Select(l => l.Trim().Trim('"'))
                 .Where(l => l.Length > 0)
                 .ToList();
+            lines = lines.Select(NormalizePath).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
             if (lines.Count == 0)
             {
                 System.Windows.MessageBox.Show(this, "Paste at least one source folder.", "Vackup");
